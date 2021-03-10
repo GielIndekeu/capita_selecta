@@ -1,10 +1,11 @@
 import typing
 from abc import ABC, abstractmethod
+from timeout import timeout
 
 from orderedset import OrderedSet
 from pylo.language.commons import Functor
 
-from loreleai.language.lp import c_pred, Clause, Procedure, Atom, c_var, c_const, Body, List, Pair, list_func
+from loreleai.language.lp import c_pred, Clause, Procedure, Atom, c_var, c_const, Body, List, Pair, list_func, Not
 from loreleai.learning.hypothesis_space import TopDownHypothesisSpace
 from loreleai.learning.language_filtering import has_singleton_vars, has_duplicated_literal
 from loreleai.learning.language_manipulation import plain_extension
@@ -19,6 +20,27 @@ class SimpleBreadthFirstLearner(TemplateLearner):
         super().__init__(solver_instance)
         self._max_body_literals = max_body_literals
 
+    # overrides learn of the TemplateLearner
+    def _execute_program(self, clause: Clause, examples: Task) -> typing.Sequence[Atom]:
+        """
+        Evaluates a clause using the Prolog engine and background knowledge
+
+        Returns a set of atoms that the clause covers
+        """
+        #  print("_execute_program(self, clause) => => trying clause: " + str(clause))
+        if len(clause.get_body().get_literals()) == 0:
+            return []
+        if not self._solver.has_solution(*clause.get_body().get_literals()):
+            return []
+        self._solver.assertz(clause=clause)
+        pos, _ = examples.get_examples()
+        covered = []
+        for example in pos:
+            if self._solver.query(example):
+                covered.append(example)
+        self._solver.retract(clause=clause)     # <-- just added
+        return covered
+
     def initialise_pool(self):
         self._candidate_pool = OrderedSet()
 
@@ -31,45 +53,44 @@ class SimpleBreadthFirstLearner(TemplateLearner):
     def get_from_pool(self) -> Clause:
         return self._candidate_pool.pop(0)
 
+    @timeout(5)
+    def _has_solution(self, query):
+        has_solution = self._solver.has_solution(query)
+        return has_solution
+
     def evaluate(self, examples: Task, clause: Clause) -> typing.Union[int, float]:
         """
         This function differs from the origional in that it does not check which examples are covered, but checks
         instead rather or not the clause has a solution
         """
-        print("evaluating: " + str(clause))
+        print("evaluating: %60s" % str(clause), end='')
         if len(clause.get_body().get_literals()) == 0:
+            print(" -> no body literals")
             return 0
-        has_solution = self._solver.has_solution(*clause.get_body().get_literals())
+        has_solution = False
+        try:
+            has_solution = self._has_solution(*clause.get_body().get_literals())
+        except Exception:
+            print(" -> timeout on 'has_solution', no solution presumed")
+            return 0
+        # has_solution = self._solver.has_solution(*clause.get_body().get_literals())
         if not has_solution:
+            print(" -> has no solution")
             return 0
         self._solver.assertz(clause=clause)
         pos, neg = examples.get_examples()
         for example in neg:
             if self._solver.query(example):
                 self._solver.retract(clause=clause)
+                print(" -> covers a negative example: " + str(example))
                 return 0
         covered = 0
         for example in pos:
             if self._solver.query(example):
                 covered += 1
-        print("success:  " + str(covered) + " pos examples covered")
+        print(" -> " + str(covered) + " examples covered")
+        self._solver.retract(clause=clause)
         return covered
-        #covered = self._execute_program(clause)
-        """
-        pos, neg = examples.get_examples()
-        covered_pos = pos.intersection(covered)
-        covered_neg = neg.intersection(covered)
-        if (len(covered_pos) != 0) or (len(covered_neg) != 0):
-            print("covered pos:")
-            print(covered_pos)
-            print("covered neg:")
-            print(covered_neg)
-        if len(covered_neg) > 0:
-            return 0
-        else:
-            return len(covered_pos)
-        """
-
 
     def stop_inner_search(self, eval: typing.Union[int, float], examples: Task, clause: Clause) -> bool:
         if eval > 0:
@@ -95,6 +116,27 @@ class SimpleBreadthFirstLearner(TemplateLearner):
                 hypothesis_space.remove(exps[ind][0])
         return new_exps
 
+    # overrides learn of the TemplateLearner
+    def learn(self, examples: Task, knowledge: Knowledge, hypothesis_space: TopDownHypothesisSpace):
+        """
+        General learning loop
+        """
+
+        self._assert_knowledge(knowledge)
+        final_program = []
+        examples_to_use = examples
+        pos, _ = examples_to_use.get_examples()
+        while len(final_program) == 0 or len(pos) > 0:
+            # learn na single clause
+            cl = self._learn_one_clause(examples_to_use, hypothesis_space)
+            final_program.append(cl)
+            # update covered positive examples
+            covered = self._execute_program(cl, examples)
+            pos, neg = examples_to_use.get_examples()
+            pos = pos.difference(covered)
+            examples_to_use = Task(pos, neg)
+        return final_program
+
 
 if __name__ == '__main__':
     # defining Constants
@@ -103,9 +145,12 @@ if __name__ == '__main__':
     sp = c_const("\' \'")  # the space character
     # defining Predicates
     take_word = c_pred("take_word", 3)
+    split_on_first_word = c_pred("split_on_first_word", 3)
+    split_on_second_word = c_pred("split_on_second_word", 3)
     second_word = c_pred("second_word", 2)
     head = c_pred("head", 2)
     tail = c_pred("tail", 2)
+    equal = c_pred("equal", 2)
 
     # defining Variables
     X = c_var("X")
@@ -121,6 +166,13 @@ if __name__ == '__main__':
     l_ = c_const("\'l\'")
     n_ = c_const("\'n\'")
     d_ = c_const("\'d\'")
+    k_ = c_const("\'k\'")
+    u_ = c_const("\'u\'")
+    j_ = c_const("\'j\'")
+    a_ = c_const("\'a\'")
+    v_ = c_const("\'v\'")
+    o_ = c_const("\'o\'")
+    s_ = c_const("\'s\'")
     Head = c_var("Head")
     Tail = c_var("Tail")
     Head1 = c_var("Head1")
@@ -131,45 +183,59 @@ if __name__ == '__main__':
     # defining Clauses
     headClause = head(Pair(X, Y), X)
     tailClause = tail(Pair(X, Y), Y)
+    equalClause = equal(X, X)
+
+    case_0 = split_on_first_word(em, em, em)
+    case_1 = split_on_first_word(Pair(X, em), List([X]), em)
+    case_2 = (split_on_first_word(Pair(X, Y1), List([X]), Y) <= head(Y1, sp) & tail(Y1, Y))
+    case_3 = (split_on_first_word(Pair(X, Y1), Pair(X, Y2), Y) <= split_on_first_word(Y1, Y2, Y) & Not(equal(X, sp)))
+    case_b0 = split_on_second_word(em, em, em)
+    case_b1 = (split_on_second_word(X, Y, Z) <= split_on_first_word(X, Y1, Y2) & split_on_first_word(Y2, Y, Z))
     """
-    Below should be equivalent to what the folowing is in SWI Prolog:
-    take_word([], [], 1)                  :- true
-    take_word([' ', Tail ], [], 1)        :- true
-    take_word([X  | Tail1], [X|Tail2], 1) :- take_word(Tail1, Tail2, 1)
-    take_word([' '| Tail1], Tail2,     X) :- take_word(Tail1, Tail2, X-1)
-    take_word([ _ | Tail1], Tail2,     X) :- take_word(Tail1, Tail2, X)
+    case_2 = Clause(Atom(split_on_first_word, [Pair(X, Y1), List([X]), Y]),
+                    Body(Atom(head, [Y1, sp]), Atom(tail, [Y1, Y])))
+    case_3 = Clause(Atom(split_on_first_word, [Pair(X, Y1), Pair(X, Y2), Y]),
+                    Body(Atom(split_on_first_word, [Y1, Y2, Y])))
 
-    This however contructing a list as a pair, of which the second element is itself a pair
-    e.g., [a, b, c] becomes Pair(a, Pair(b, Pair(c, em))), with em representing an empty element
-
+    case_b0 = split_on_second_word(em, em, em)
+    case_b1 = Clause(Atom(split_on_second_word, [X, Y, Z]),
+                     Body(Atom(split_on_first_word, [X, Y1, Y2]), Atom(split_on_first_word, [Y2, Y, Z])))
     """
     """
     case_0 = take_word(em, em, 1)
-    case_1 = take_word(X, em, 1) <= head(X, sp)
-    case_2 = take_word(X1, X2, 1) <= head(X1, X), head(X2, X), tail(X1, Y1), tail(X2, Y2), take_word(Y1, Y2, 1)
-    case_3 = take_word(X1, Y2, 2) <= head(X1, sp), tail(X1, Y1), take_word(Y1, Y2, 1)
-    case_4 = take_word(X1, Y2, 2) <= tail(X1, Y1), take_word(Y1, Y2, 2)
-    case_5 = take_word(X1, Y2, 3) <= head(X1, sp), tail(X1, Y1), take_word(Y1, Y2, 2)
-    case_6 = take_word(X1, Y2, 3) <= tail(X1, Y1), take_word(Y1, Y2, 3)
+    case_1 = (take_word(X, em, 1) <= head(X, sp))
+    case_2 = (take_word(X1, X2, 1) <= head(X1, X) & head(X2, X) & tail(X1, Y1) & tail(X2, Y2) & take_word(Y1, Y2, 1))
+    case_3 = (take_word(X1, Y2, 2) <= head(X1, sp) & tail(X1, Y1) & take_word(Y1, Y2, 1))
+    case_4 = (take_word(X1, Y2, 2) <= tail(X1, Y1) & take_word(Y1, Y2, 2))
+    case_5 = (take_word(X1, Y2, 3) <= head(X1, sp) & tail(X1, Y1) & take_word(Y1, Y2, 2))
+    case_6 = (take_word(X1, Y2, 3) <= tail(X1, Y1) & take_word(Y1, Y2, 3))
     """
     # specify the background knowledge
     background = Knowledge()
     # positive examples
-    s_in = List(["g", "i", "e", "l", sp, "i", "n", "d", "e", sp, "k", "e", "u"])
-    s_out = List(["i", "n", "d", "e"])
+    s_in1 = List([g_, i_, e_, l_, sp, i_, n_, d_, e_, sp, k_, e_, u_])
+    # s_out1 = List([g_, i_, e_, l_])
+    s_out1 = List([i_, n_, d_, e_])
+    s_in2 = List([j_, a_, n_, sp, v_, o_, s_, s_, sp, g_, i_])
+    # s_out2 = List([j_, a_, n_])
+    s_out2 = List([v_, o_, s_, s_])
+    s_in3 = List([g_, i_, e_, l_, sp, i_, n_, d_, e_, sp, k_, e_, u_])
+    s_out3 = List([i_, e_, l_])
+    s_in4 = List([g_, i_, e_, l_, sp, i_, n_, d_, e_, sp, k_, e_, u_])
+    s_out4 = List([k_, e_, u_])
 
     ig_1 = List([g_, i_, e_, l_])
-    ug_1 = g_
+    ug_1 = i_
     ig_2 = List([l_, e_, i_])
-    ug_2 = l_
+    ug_2 = e_
     if_1 = List([g_, i_, e_, l_])
-    uf_1 = i_
+    uf_1 = g_
     if_2 = List([l_, e_, i_])
-    uf_2 = e_
-    pos = {second_word(ig_1, ug_1), second_word(ig_2, ug_2)}
+    uf_2 = List([l_, e_, i_])
+    pos = {second_word(s_in1, s_out1), second_word(s_in2, s_out2)}
 
     # negative examples
-    neg = {second_word(if_1, uf_1), second_word(if_2, uf_2)}
+    neg = {second_word(s_in3, s_out3), second_word(s_in4, s_out4)}
 
     task = Task(positive_examples=pos, negative_examples=neg)
 
@@ -177,19 +243,42 @@ if __name__ == '__main__':
     prolog = SWIProlog()
     prolog.assertz(headClause)
     prolog.assertz(tailClause)
+    prolog.assertz(equalClause)
+    prolog.assertz(case_0)
+    prolog.assertz(case_1)
+    prolog.assertz(case_2)
+    prolog.assertz(case_3)
+
+    prolog.assertz(case_b0)
+    prolog.assertz(case_b1)
+    """
+    cl = (second_word(X, Y) <= (split_on_first_word(X, Y1, Y2) & split_on_first_word(Y2, Y, Z)))
+    prolog.assertz(cl)
+    print(prolog.query(second_word(s_in4, s_out4)))"""
+    # prolog.assertz(case_2)
+    # prolog.assertz(case_3)
+    # prolog.assertz(case_4)
+    # prolog.assertz(case_5)
+    # prolog.assertz(case_6)
 
     learner = SimpleBreadthFirstLearner(prolog, max_body_literals=2)
 
-    # create the hypothesis space           lambda x: plain_extension(x, take_word, connected_clauses=True),
-    hs = TopDownHypothesisSpace(primitives=[lambda x: plain_extension(x, head, connected_clauses=True),
-                                            lambda x: plain_extension(x, tail, connected_clauses=True)],
+    # create the hypothesis space                   lambda x: plain_extension(x, head, connected_clauses=True),
+    #                                               lambda x: plain_extension(x, tail, connected_clauses=True),
+    #                                               lambda x: plain_extension(x, split_on_second_word, connected_clauses=True),
+    """
+    hs = TopDownHypothesisSpace(primitives=[lambda x: plain_extension(x, split_on_first_word, connected_clauses=True),
+                                            lambda x: plain_extension(x, split_on_second_word, connected_clauses=True)],
                                 head_constructor=second_word,
                                 expansion_hooks_reject=[lambda x, y: has_duplicated_literal(x, y)],
+                                recursive_procedures=False)
+    # lambda x, y: has_singleton_vars(x, y),
+    """
+    hs = TopDownHypothesisSpace(primitives=[lambda x: plain_extension(x, split_on_first_word, connected_clauses=True)],
+                                head_constructor=second_word,
+                                expansion_hooks_reject=[],
                                 recursive_procedures=True)
-                                                        # lambda x, y: has_singleton_vars(x, y),
+
     program = learner.learn(task, background, hs)
 
     print(program)
-
-
-
