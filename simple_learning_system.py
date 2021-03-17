@@ -52,30 +52,15 @@ class TemplateLearner(ABC):
 
         Returns a set of atoms that the clause covers
         """
-        print("_execute_program(self, clause) => => trying clause: " + str(clause))
         if len(clause.get_body().get_literals()) == 0:
             return []
         else:
             head_predicate = clause.get_head().get_predicate()
             head_variables = clause.get_head_variables()
-            #  print("query: " + str(*clause.get_body().get_literals()))    # <--------
-
-            # The section below is changed to the section after this comment block, on advice of tutor
             sols = self._solver.query(*clause.get_body().get_literals())
             print("sols: " + str(sols))
             sols = [head_predicate(*[s[v] for v in head_variables]) for s in sols]
             return sols
-            """
-            has_solution = self._solver.has_solution(*clause.get_body().get_literals())
-            if not has_solution:
-                return []
-            self._solver.assertz(clause=clause)
-            pos, neg = examples_to_use.get_examples()
-            for example in pos:
-                
-            print(sols)
-
-            return sols"""
 
 
     @abstractmethod
